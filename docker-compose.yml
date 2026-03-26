@@ -1,0 +1,133 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: observability-redis
+    ports:
+      - "6379:6379"
+
+  database-service:
+    build:
+      context: .
+      dockerfile: services/database_service/Dockerfile
+    container_name: database-service
+    environment:
+      SERVICE_NAME: database-service
+      SERVICE_PORT: 8002
+      STREAM_URL: redis://redis:6379/0
+      LOGS_TOPIC: logs_topic
+      METRICS_TOPIC: metrics_topic
+    ports:
+      - "8002:8002"
+    depends_on:
+      - redis
+
+  cache-service:
+    build:
+      context: .
+      dockerfile: services/cache_service/Dockerfile
+    container_name: cache-service
+    environment:
+      SERVICE_NAME: cache-service
+      SERVICE_PORT: 8001
+      DATABASE_SERVICE_URL: http://database-service:8002
+      STREAM_URL: redis://redis:6379/0
+      LOGS_TOPIC: logs_topic
+      METRICS_TOPIC: metrics_topic
+    ports:
+      - "8001:8001"
+    depends_on:
+      - redis
+      - database-service
+
+  api-service:
+    build:
+      context: .
+      dockerfile: services/api_service/Dockerfile
+    container_name: api-service
+    environment:
+      SERVICE_NAME: api-service
+      SERVICE_PORT: 8000
+      CACHE_SERVICE_URL: http://cache-service:8001
+      DATABASE_SERVICE_URL: http://database-service:8002
+      STREAM_URL: redis://redis:6379/0
+      LOGS_TOPIC: logs_topic
+      METRICS_TOPIC: metrics_topic
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - cache-service
+
+  event-processor-service:
+    build:
+      context: .
+      dockerfile: services/event_processor_service/Dockerfile
+    container_name: event-processor-service
+    environment:
+      SERVICE_NAME: event-processor-service
+      SERVICE_PORT: 8003
+      STREAM_URL: redis://redis:6379/0
+      LOGS_TOPIC: logs_topic
+      METRICS_TOPIC: metrics_topic
+      NORMALIZED_TOPIC: normalized_events_topic
+      HEALTH_TOPIC: service_health_topic
+      LATENCY_THRESHOLD_MS: 500
+      ERROR_SPIKE_COUNT: 3
+      WINDOW_SECONDS: 10
+      PROCESS_BATCH_SIZE: 64
+      ORDERING_BUFFER_SECONDS: 0.35
+    ports:
+      - "8003:8003"
+    depends_on:
+      - redis
+
+  synthetic-generator-service:
+    build:
+      context: .
+      dockerfile: services/synthetic_generator_service/Dockerfile
+    container_name: synthetic-generator-service
+    environment:
+      STREAM_URL: redis://redis:6379/0
+      LOGS_TOPIC: logs_topic
+      METRICS_TOPIC: metrics_topic
+    ports:
+      - "8004:8004"
+    depends_on:
+      - redis
+
+  rca-service:
+    build:
+      context: .
+      dockerfile: services/rca_service/Dockerfile
+    container_name: rca-service
+    environment:
+      SERVICE_NAME: rca-service
+      STREAM_URL: redis://redis:6379/0
+      NORMALIZED_TOPIC: normalized_events_topic
+      HEALTH_TOPIC: service_health_topic
+      WINDOW_SECONDS: 10
+      PROPAGATION_DELAY_SECONDS: 2
+    ports:
+      - "8005:8005"
+    depends_on:
+      - redis
+
+  remediation-service:
+    build:
+      context: .
+      dockerfile: services/remediation_service/Dockerfile
+    container_name: remediation-service
+    environment:
+      SERVICE_NAME: remediation-service
+      STREAM_URL: redis://redis:6379/0
+      REMEDIATION_TOPIC: remediation_triggers_topic
+      REMEDIATION_RESULTS_TOPIC: remediation_results_topic
+      CACHE_SERVICE_URL: http://cache-service:8001
+      REMEDIATION_COOLDOWN_SECONDS: 5
+    ports:
+      - "8006:8006"
+    depends_on:
+      - redis
+      - cache-service
