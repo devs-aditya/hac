@@ -89,3 +89,10 @@ async def put_cached_value(key: str, payload: CacheWritePayload) -> DataResponse
 async def clear_cache() -> dict[str, str]:
     CACHE.clear()
     return {"status": "cleared"}
+
+
+@app.post("/internal/clear")
+async def internal_clear_cache() -> dict[str, str | int]:
+    cleared_entries = len(CACHE)
+    CACHE.clear()
+    return {"status": "cleared", "cleared_entries": cleared_entries}

@@ -111,7 +111,7 @@ class RemediationEngine:
         try:
             if action_name == "clear_cache":
                 with httpx.Client(timeout=2.0) as client:
-                    response = client.post(f"{CACHE_SERVICE_URL}/cache/clear")
+                    response = client.post(f"{CACHE_SERVICE_URL}/internal/clear")
                     response.raise_for_status()
                     details["response"] = response.json()
             elif action_name == "restart_database":

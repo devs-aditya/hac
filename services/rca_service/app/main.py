@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from services.common.app.broker import get_stream_backend
 from services.common.app.config import get_env
@@ -18,12 +18,15 @@ SERVICE_NAME = get_env("SERVICE_NAME", "rca-service")
 NORMALIZED_TOPIC = get_env("NORMALIZED_TOPIC", "normalized_events_topic")
 HEALTH_TOPIC = get_env("HEALTH_TOPIC", "service_health_topic")
 REMEDIATION_TOPIC = get_env("REMEDIATION_TOPIC", "remediation_triggers_topic")
+REMEDIATION_RESULTS_TOPIC = get_env("REMEDIATION_RESULTS_TOPIC", "remediation_results_topic")
 WINDOW_SECONDS = int(get_env("WINDOW_SECONDS", "10"))
 PROPAGATION_DELAY_SECONDS = float(get_env("PROPAGATION_DELAY_SECONDS", "2"))
 RCA_HISTORY_SIZE = int(get_env("RCA_HISTORY_SIZE", "20"))
 UNCERTAIN_MARGIN = float(get_env("RCA_UNCERTAIN_MARGIN", "0.12"))
 LATENCY_HISTORY_SIZE = int(get_env("LATENCY_HISTORY_SIZE", "200"))
 PIPELINE_SLA_MS = float(get_env("PIPELINE_SLA_MS", "15000"))
+INCIDENT_HISTORY_LIMIT = int(get_env("INCIDENT_HISTORY_LIMIT", "100"))
+INCIDENT_INDEX_KEY = "incidents:list"
 
 DEPENDENCY_GRAPH: dict[str, list[str]] = {
     "api-service": ["cache-service"],
@@ -56,6 +59,12 @@ class Hypothesis:
     service: str
     score: float
     confidence: float
+    temporal_consistency: float
+    dependency_match: float
+    signal_strength: float
+    noise_penalty: float
+    impact_match: float
+    repeated_pattern_bonus: float
     affected_services: list[str]
     missing_impact: list[str]
     independent_failures: list[str]
@@ -80,11 +89,17 @@ class RcaEngine:
         self._triggered_incidents: dict[str, str] = {}
         self._incident_timings: dict[str, dict[str, Any]] = {}
         self._active_incident_ids: set[str] = set()
+        self._incident_records: dict[str, dict[str, Any]] = {}
+        self._incident_order: deque[str] = deque()
+        self._incident_remediation: dict[str, dict[str, Any]] = {}
+        self._redis_client = getattr(self.backend, "_client", None)
         self._latest: dict[str, Any] = {
             "primary_root_cause": [],
             "secondary_root_causes": [],
             "independent_failures": [],
             "confidence": 0.0,
+            "confidence_breakdown": {},
+            "confidence_explanation": "No RCA candidate yet",
             "status": "UNCERTAIN",
             "alternative_causes": [],
             "affected_services": [],
@@ -101,6 +116,7 @@ class RcaEngine:
         self._offsets = {
             NORMALIZED_TOPIC: "0-0",
             HEALTH_TOPIC: "0-0",
+            REMEDIATION_RESULTS_TOPIC: "0-0",
         }
         self._thread = threading.Thread(target=self._consume_loop, daemon=True)
         self._thread.start()
@@ -120,6 +136,8 @@ class RcaEngine:
                             self._record_event(payload)
                         elif topic == HEALTH_TOPIC:
                             self._record_health(payload)
+                        elif topic == REMEDIATION_RESULTS_TOPIC:
+                            self._record_remediation_result(payload)
                 self._recompute_latest()
             except Exception:
                 time.sleep(0.5)
@@ -136,6 +154,23 @@ class RcaEngine:
     def _record_health(self, payload: dict[str, Any]) -> None:
         with self._lock:
             self._health[payload["service"]] = payload
+
+    def _record_remediation_result(self, payload: dict[str, Any]) -> None:
+        incident_id = payload.get("incident_id")
+        if not incident_id:
+            return
+        with self._lock:
+            self._incident_remediation[incident_id] = dict(payload)
+            existing_record = self._incident_records.get(incident_id)
+        if not existing_record:
+            return
+        self._persist_incident(
+            incident_id=incident_id,
+            rca_payload=existing_record.get("rca"),
+            timeline_payload=existing_record.get("timeline"),
+            remediation_payload=dict(payload),
+            created_at=existing_record.get("created_at"),
+        )
 
     def _trim_locked(self, now: float) -> None:
         cutoff = now - WINDOW_SECONDS
@@ -171,6 +206,8 @@ class RcaEngine:
                 "secondary_root_causes": [],
                 "independent_failures": [],
                 "confidence": 0.0,
+                "confidence_breakdown": {},
+                "confidence_explanation": "All services are healthy in the active window",
                 "status": "UNCERTAIN",
                 "alternative_causes": [],
                 "affected_services": [],
@@ -196,6 +233,8 @@ class RcaEngine:
                 "secondary_root_causes": [],
                 "independent_failures": [],
                 "confidence": 0.12,
+                "confidence_breakdown": {},
+                "confidence_explanation": "No candidate could explain downstream impact in the active sliding window",
                 "status": "UNCERTAIN",
                 "alternative_causes": [],
                 "affected_services": list(degraded_or_failed.keys()),
@@ -262,6 +301,26 @@ class RcaEngine:
             "secondary_root_causes": secondary_root_causes,
             "independent_failures": independent_failures,
             "confidence": primary.confidence,
+            "confidence_breakdown": {
+                "temporal_consistency": primary.temporal_consistency,
+                "dependency_match": primary.dependency_match,
+                "signal_strength": primary.signal_strength,
+                "noise_penalty": primary.noise_penalty,
+                "impact_match": primary.impact_match,
+                "repeat_pattern_bonus": primary.repeated_pattern_bonus,
+                "raw_score": round(
+                    0.3 * primary.temporal_consistency
+                    + 0.3 * primary.dependency_match
+                    + 0.3 * primary.signal_strength
+                    + primary.noise_penalty,
+                    3,
+                ),
+                "final_confidence": primary.confidence,
+            },
+            "confidence_explanation": self._confidence_explanation(
+                primary,
+                alternatives[0] if alternatives else None,
+            ),
             "status": status,
             "alternative_causes": [
                 {"service": candidate.service, "confidence": candidate.confidence}
@@ -289,6 +348,16 @@ class RcaEngine:
         result["timings"]["status"] = "completed" if remediation_triggered else "active"
         self._incident_timings[incident_id] = dict(result["timings"])
         self._record_latency_sample(result)
+        timeline_payload = self._timeline_for(result, events).get("timeline", [])
+        with self._lock:
+            remediation_payload = dict(self._incident_remediation.get(incident_id, {}))
+        self._persist_incident(
+            incident_id=incident_id,
+            rca_payload=result,
+            timeline_payload=timeline_payload,
+            remediation_payload=remediation_payload,
+            created_at=result.get("evaluated_at"),
+        )
         with self._lock:
             self._latest = result
             self._history.append(result)
@@ -309,29 +378,28 @@ class RcaEngine:
             first_event = min(service_events, key=lambda item: item["_event_epoch"])
             affected_services, missing_impact_candidates, causal_chain, impact_match_score, valid = self._propagation_assessment(service, events, first_event)
             temporal_consistency = self._temporal_consistency(service, first_event, events)
-            dependency_consistency = self._dependency_consistency(service, first_event, events)
-            signal_strength = self._signal_strength(first_event, health.get(service, {}))
+            dependency_match = self._dependency_consistency(service, first_event, events)
+            signal_strength = self._signal_strength(service, first_event, events, health.get(service, {}))
             repeated_patterns = self._repeated_pattern_bonus(service)
-            noise_factor = self._noise_factor(service, first_event, events)
             missing_impact, independent_failures = self._classify_missing_or_independent(
                 events,
                 missing_impact_candidates,
             )
+            noise_penalty = self._noise_penalty(
+                service=service,
+                first_event=first_event,
+                events=events,
+                missing_impact=missing_impact,
+                valid=valid,
+            )
 
             raw_score = (
-                0.22 * temporal_consistency
-                + 0.18 * dependency_consistency
-                + 0.20 * signal_strength
-                + 0.28 * impact_match_score
-                + 0.07 * repeated_patterns
-                - 0.15 * noise_factor
+                0.3 * temporal_consistency
+                + 0.3 * dependency_match
+                + 0.3 * signal_strength
+                + noise_penalty
             )
-            if not valid:
-                raw_score -= 0.25
-            raw_score -= min(0.25, 0.12 * len(missing_impact))
-            if not affected_services and DEPENDENTS_GRAPH.get(service):
-                raw_score -= 0.15
-            confidence = round(max(0.05, min(0.95, raw_score)), 2)
+            confidence = round(max(0.0, min(1.0, raw_score)), 2)
             reasoning = self._reasoning(
                 service=service,
                 first_event=first_event,
@@ -346,8 +414,14 @@ class RcaEngine:
             hypotheses.append(
                 Hypothesis(
                     service=service,
-                    score=raw_score,
+                    score=confidence,
                     confidence=confidence,
+                    temporal_consistency=round(temporal_consistency, 2),
+                    dependency_match=round(dependency_match, 2),
+                    signal_strength=round(signal_strength, 2),
+                    noise_penalty=round(noise_penalty, 2),
+                    impact_match=round(impact_match_score, 2),
+                    repeated_pattern_bonus=round(repeated_patterns, 2),
                     affected_services=affected_services,
                     missing_impact=missing_impact,
                     independent_failures=independent_failures,
@@ -360,7 +434,7 @@ class RcaEngine:
                     valid=valid,
                 )
             )
-        return [hypothesis for hypothesis in hypotheses if hypothesis.score > 0.0]
+        return [hypothesis for hypothesis in hypotheses if hypothesis.confidence > 0.0]
 
     def _propagation_assessment(
         self,
@@ -432,17 +506,36 @@ class RcaEngine:
         ]
         return 1.0 if not upstream else 0.35
 
-    def _signal_strength(self, event: dict[str, Any], health: dict[str, Any]) -> float:
-        score = 0.25
-        if event.get("status") == "FAILED":
-            score += 0.25
-        if event.get("event_type") == "ERROR":
-            score += 0.2
-        latency = float(event.get("latency") or 0.0)
-        if latency > 500:
-            score += min(0.15, latency / 4000.0)
-        score += min(0.15, float(health.get("recent_error_count", 0)) / 10.0)
-        return min(score, 1.0)
+    def _signal_strength(
+        self,
+        service: str,
+        event: dict[str, Any],
+        events: list[dict[str, Any]],
+        health: dict[str, Any],
+    ) -> float:
+        service_events = [item for item in events if item.get("service") == service]
+        anomaly_events = [
+            item for item in service_events
+            if item.get("status") in {"FAILED", "DEGRADED"} or item.get("event_type") == "ERROR"
+        ]
+        error_events = [item for item in anomaly_events if item.get("event_type") == "ERROR"]
+        failed_events = [item for item in anomaly_events if item.get("status") == "FAILED"]
+        latency_spikes = [item for item in anomaly_events if float(item.get("latency") or 0.0) > 500.0]
+
+        error_score = min(1.0, len(error_events) / 5.0)
+        failure_score = min(1.0, len(failed_events) / 3.0)
+        latency_score = min(1.0, len(latency_spikes) / 4.0)
+        health_error_score = min(1.0, float(health.get("recent_error_count", 0)) / 10.0)
+        first_event_bonus = 0.2 if event.get("status") == "FAILED" else 0.1 if event.get("status") == "DEGRADED" else 0.0
+
+        combined = (
+            0.35 * error_score
+            + 0.35 * failure_score
+            + 0.2 * latency_score
+            + 0.1 * health_error_score
+            + first_event_bonus
+        )
+        return round(max(0.0, min(1.0, combined)), 2)
 
     def _repeated_pattern_bonus(self, service: str) -> float:
         if not self._history:
@@ -465,6 +558,28 @@ class RcaEngine:
             and event["service"] not in DEPENDENTS_GRAPH.get(service, [])
         ]
         return min(1.0, len(competing) / 3.0)
+
+    def _noise_penalty(
+        self,
+        *,
+        service: str,
+        first_event: dict[str, Any],
+        events: list[dict[str, Any]],
+        missing_impact: list[str],
+        valid: bool,
+    ) -> float:
+        conflicting_signals = self._noise_factor(service, first_event, events)
+        missing_signal_penalty = min(0.2, 0.08 * len(missing_impact))
+        validity_penalty = 0.08 if not valid else 0.0
+        competing_root_penalty = min(0.12, 0.04 * len({
+            event.get("service")
+            for event in events
+            if event.get("service") != service
+            and event.get("status") in {"FAILED", "DEGRADED"}
+            and abs(event.get("_event_epoch", 0.0) - first_event.get("_event_epoch", 0.0)) <= PROPAGATION_DELAY_SECONDS
+        }))
+        penalty = min(0.45, 0.15 * conflicting_signals + missing_signal_penalty + validity_penalty + competing_root_penalty)
+        return round(-penalty, 2)
 
     def _classify_missing_or_independent(
         self,
@@ -504,6 +619,31 @@ class RcaEngine:
             if candidate.score >= 0.45:
                 secondaries.append(candidate.service)
         return secondaries[:2]
+
+    def _confidence_explanation(self, primary: Hypothesis, alternative: Hypothesis | None) -> str:
+        chain = primary.causal_chain[0] if primary.causal_chain else self._display_name(primary.service)
+        propagation_text = "clear propagation to dependents" if primary.affected_services else "limited downstream propagation"
+        signal_text = (
+            "strong error and failure signals" if primary.signal_strength >= 0.7
+            else "moderate anomaly signals" if primary.signal_strength >= 0.4
+            else "weak anomaly signals"
+        )
+        noise_text = (
+            "low noise" if primary.noise_penalty >= -0.08
+            else "noticeable competing noise" if primary.noise_penalty >= -0.2
+            else "high noise from conflicting or missing signals"
+        )
+        explanation = (
+            f"Confidence {primary.confidence:.2f}: {self._display_name(primary.service)} appears to be the root cause "
+            f"with {propagation_text} along {chain}, {signal_text}, and {noise_text}."
+        )
+        if alternative:
+            margin = round(primary.confidence - alternative.confidence, 3)
+            explanation += (
+                f" Next-best alternative is {self._display_name(alternative.service)} "
+                f"(confidence {alternative.confidence:.2f}, confidence gap {margin:.3f})."
+            )
+        return explanation
 
     def _reasoning(
         self,
@@ -551,9 +691,78 @@ class RcaEngine:
         return service.replace("-service", "")
 
     def _incident_id(self, hypothesis: Hypothesis) -> str:
-        normalized_ts = (hypothesis.first_timestamp or utc_timestamp_ms()).replace(":", "").replace(".", "").replace("Z", "Z")
-        ingestion_ts = (hypothesis.first_ingestion_timestamp or "noingest").replace(":", "").replace(".", "").replace("Z", "Z")
-        return f"{hypothesis.service}:{normalized_ts}:{ingestion_ts}"
+        base_timestamp = hypothesis.first_ingestion_timestamp or hypothesis.first_timestamp or utc_timestamp_ms()
+        timestamp_ms = int(parse_timestamp_to_epoch(base_timestamp) * 1000.0)
+        return f"inc_{timestamp_ms}_{hypothesis.service}"
+
+    def _incident_key(self, incident_id: str) -> str:
+        return f"incident:{incident_id}"
+
+    def _persist_incident(
+        self,
+        *,
+        incident_id: str,
+        rca_payload: dict[str, Any] | None,
+        timeline_payload: list[dict[str, Any]] | None,
+        remediation_payload: dict[str, Any] | None,
+        created_at: str | None,
+    ) -> None:
+        with self._lock:
+            existing = self._incident_records.get(incident_id, {})
+            incident_record = {
+                "incident_id": incident_id,
+                "rca": rca_payload if rca_payload is not None else dict(existing.get("rca", {})),
+                "timeline": timeline_payload if timeline_payload is not None else list(existing.get("timeline", [])),
+                "remediation": remediation_payload if remediation_payload is not None else dict(existing.get("remediation", {})),
+                "created_at": created_at or existing.get("created_at") or utc_timestamp_ms(),
+            }
+            self._incident_records[incident_id] = incident_record
+            if incident_id in self._incident_order:
+                self._incident_order.remove(incident_id)
+            self._incident_order.appendleft(incident_id)
+            while len(self._incident_order) > INCIDENT_HISTORY_LIMIT:
+                dropped = self._incident_order.pop()
+                self._incident_records.pop(dropped, None)
+
+        client = self._redis_client
+        if client is None:
+            return
+        try:
+            client.set(self._incident_key(incident_id), json.dumps(incident_record, ensure_ascii=True))
+            client.lrem(INCIDENT_INDEX_KEY, 0, incident_id)
+            client.lpush(INCIDENT_INDEX_KEY, incident_id)
+            overflow = client.lrange(INCIDENT_INDEX_KEY, INCIDENT_HISTORY_LIMIT, -1)
+            if overflow:
+                for overflow_incident_id in overflow:
+                    client.delete(self._incident_key(overflow_incident_id))
+            client.ltrim(INCIDENT_INDEX_KEY, 0, INCIDENT_HISTORY_LIMIT - 1)
+        except Exception:
+            return
+
+    def list_incidents(self) -> list[str]:
+        client = self._redis_client
+        if client is not None:
+            try:
+                return [str(item) for item in client.lrange(INCIDENT_INDEX_KEY, 0, INCIDENT_HISTORY_LIMIT - 1)]
+            except Exception:
+                pass
+        with self._lock:
+            return list(self._incident_order)
+
+    def get_incident(self, incident_id: str) -> dict[str, Any] | None:
+        client = self._redis_client
+        if client is not None:
+            try:
+                payload = client.get(self._incident_key(incident_id))
+                if payload:
+                    return json.loads(payload)
+            except Exception:
+                pass
+        with self._lock:
+            record = self._incident_records.get(incident_id)
+            if record is None:
+                return None
+            return dict(record)
 
     def _build_timing_snapshot(self, incident_id: str, hypothesis: Hypothesis, evaluated_at: str) -> dict[str, Any]:
         existing = self._incident_timings.get(incident_id, {})
@@ -813,10 +1022,7 @@ class RcaEngine:
             return "Service"
         return service.replace("-service", "").replace("-", " ").title()
 
-    def rca_timeline(self) -> dict[str, Any]:
-        with self._lock:
-            latest = dict(self._latest)
-            events = list(self._events)
+    def _timeline_for(self, latest: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
         incident_id = latest.get("incident_id")
         if not incident_id:
             return {
@@ -874,6 +1080,12 @@ class RcaEngine:
             "causal_chain": latest.get("causal_chain", []),
             "timeline": timeline,
         }
+
+    def rca_timeline(self) -> dict[str, Any]:
+        with self._lock:
+            latest = dict(self._latest)
+            events = list(self._events)
+        return self._timeline_for(latest, events)
 
     def latest(self) -> dict[str, Any]:
         with self._lock:
@@ -954,6 +1166,19 @@ async def latest_rca() -> dict[str, Any]:
 @app.get("/rca/timeline")
 async def rca_timeline() -> dict[str, Any]:
     return engine.rca_timeline()
+
+
+@app.get("/incidents")
+async def incidents() -> dict[str, list[str]]:
+    return {"incident_ids": engine.list_incidents()}
+
+
+@app.get("/incidents/{incident_id}")
+async def incident_by_id(incident_id: str) -> dict[str, Any]:
+    incident = engine.get_incident(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return incident
 
 
 @app.get("/debug/latency")

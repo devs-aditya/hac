@@ -222,6 +222,37 @@ These topics are now active for ingestion and normalization.
 | --- | --- |
 | `/rca/latest` | returns the latest causal RCA result from the active sliding window |
 
+### `/rca/latest` Response Highlights
+
+`confidence_breakdown` and `confidence_explanation` are included to explain how RCA confidence was derived.
+
+```json
+{
+  "incident_id": "database-service:2026-03-27T120000123Z:2026-03-27T120000140Z",
+  "primary_root_cause": ["database-service"],
+  "secondary_root_causes": [],
+  "independent_failures": [],
+  "confidence": 0.86,
+  "confidence_breakdown": {
+    "temporal_consistency": 1.0,
+    "dependency_match": 1.0,
+    "signal_strength": 0.87,
+    "noise_penalty": 0.0,
+    "impact_match": 1.0,
+    "repeat_pattern_bonus": 0.25,
+    "raw_score": 0.857,
+    "final_confidence": 0.86
+  },
+  "confidence_explanation": "Confidence 0.86 for Database is based on strong temporal consistency, dependency graph alignment, high signal strength, low noise penalty.",
+  "status": "CONFIDENT",
+  "alternative_causes": [],
+  "affected_services": ["cache-service", "api-service"],
+  "missing_impact": [],
+  "causal_chain": ["database-service -> cache-service -> api-service"],
+  "reasoning": ["Database failed first", "Observed impact matches dependency graph"]
+}
+```
+
 ## Topic Payload Guidance
 
 | Topic | Key | Value Shape |
